@@ -1,0 +1,7 @@
+name: surveillance_tracking
+channels:
+  - conda-forge
+dependencies:
+  - numpy-stl=2.11.2
+  - opencv=4.3.0
+  - imutils=0.5.3
