@@ -22,10 +22,11 @@
 # Finally we use face detection to get an idea of the "quality" of the
 # image for taking a still when we see faces.
 
-PRODUCTION = False
+PRODUCTION = True
 DEBUG_INPUT = False
-DEBUG_TRACKER_REPLAY = True
+DEBUG_TRACKER_REPLAY = False
 DEBUG_TRACKER_DECISIONS = True
+DEBUG_TRACKER_DECISIONS_VIDEO = False
 
 import numpy as np
 import cv2
@@ -287,7 +288,7 @@ class VideoTracking:
             self.SaveBackground(self.background_remover, self.DebugFile(tracker.file_name + '_background'))
             tracker.tracked_video = cv2.VideoWriter(self.DebugFile(tracker.file_name + '.avi'), fourcc, 12.0, (1920,1080))
 
-        if DEBUG_TRACKER_DECISIONS:
+        if DEBUG_TRACKER_DECISIONS_VIDEO:
             tracker.small_tracked_video = cv2.VideoWriter(self.DebugFile(tracker.file_name + '.small_colour_frame.avi'), fourcc, 12.0, (int(1920/self.SCALE),int(1080/self.SCALE)))
 
     def OnTickTracker(self, tracker, colour_frame, small_colour_frame):
@@ -440,6 +441,14 @@ class VideoTracking:
         merged_foreground_box = self.ExpandBox(merged_foreground_box, small_colour_frame.shape, 1.2)
         tracked_bbox = self.Intersection(person_bbox, merged_foreground_box)
 
+        # If the resulting tracked_bbox is smaller area than 50% of the original person match
+        # Then likely this is just noise again. We will just ignore it
+        person_area = person_bbox[2] * person_bbox[3]
+        tracked_area = tracked_bbox[2] * tracked_bbox[3]
+        if tracked_area < (person_area / 2):
+            print (str(self.frame_count) + ' : bbox with foreground intersection: ' + str(tracked_bbox) + ' is too small compared to the person bbox: ' + str(person_bbox) + '. Assuming noise')
+            return None
+
         # Now we may already have a tracker for this person, lets check and if so we want to
         # skip them and just keep using the existing tracker.
         existing_tracked_bboxes = [tracker.last_bbox for tracker in self.trackers]
@@ -489,7 +498,7 @@ class VideoTracking:
                     new_objects_tracked.append(tracker)
                     new_tracked_bboxes.append(tracker.last_bbox)
                     self.OnStartTracker(tracker)
-        return (new_objects_tracked, list(people_bboxes), new_tracked_bboxes)
+        return (new_objects_tracked, list(people_bboxes), new_tracked_bboxes, list(people_weights))
 
 
     def GetForegroundObjects(self, tracker, foreground_contours, foreground_bboxes):
@@ -614,6 +623,7 @@ class VideoTracking:
 
         tracked_bboxes = []
         people_bboxes = []
+        people_weights = []
 
         # Skip this frame if too much has changed
         area_foreground = np.sum(np.greater(small_gray_foreground_frame, 200))
@@ -621,7 +631,7 @@ class VideoTracking:
         percentage_changed = 100.0 * area_foreground / total_area
         if len(self.trackers) == 0 and percentage_changed > 40:
             print ('Too much of the image has changed, likely transition from day to night camera so skipping this frame. area canged: ' + str(area_foreground) + ' total area: ' + str(total_area) + ' percentage_changed: ' + str(percentage_changed))
-            return (tracked_bboxes, people_bboxes)
+            return (tracked_bboxes, people_bboxes, people_weights)
         
         # Tick all the active trackers which will update the existing self.trackers list based on the current frame
         self.UpdateActiveTrackers(
@@ -656,7 +666,7 @@ class VideoTracking:
         
         # Any untracked objects are candidates for new potential new people to be detected and tracked
         if len(untracked_foreground_bboxes) > 0:
-            ot, pb, tb = self.ActivateNewTrackers(
+            ot, pb, tb, pw = self.ActivateNewTrackers(
                 colour_frame,
                 small_colour_frame,
                 small_gray_frame,
@@ -664,10 +674,11 @@ class VideoTracking:
                 foreground_bboxes)
             objects_tracked += ot
             people_bboxes += pb
+            people_weights += pw
             tracked_bboxes += tb
 
         # @todo We no longer properly maintain tracked_bboxes as we can modify an existing tracker. Maybe re-init it instead?
-        return (tracked_bboxes, people_bboxes)
+        return (tracked_bboxes, people_bboxes, people_weights)
 
     def Load(self, file_name, raise_on_error=False):
         self.background_remover = self.LoadBackground(file_name + '_background', raise_on_error=False)
@@ -822,7 +833,7 @@ max:'''+str(spots_max)+''',
             # Extract the objects/contours from the foreground
             foreground_contours, foreground_bboxes = self.FindForegroundObjects(small_gray_foreground_frame)
 
-            tracked_bboxes, people_bboxes = self.TrackObjects(
+            tracked_bboxes, people_bboxes, people_weights = self.TrackObjects(
                 colour_frame,
                 small_colour_frame,
                 small_gray_frame,
@@ -841,7 +852,7 @@ max:'''+str(spots_max)+''',
 
             self.UpdateTrackingPositionProbabilities(self.trackers, foreground_contours, foreground_bboxes)
             
-            if DEBUG_TRACKER_DECISIONS or DEBUG_INPUT or PRODUCTION:
+            if DEBUG_TRACKER_DECISIONS or DEBUG_TRACKER_DECISIONS_VIDEO or DEBUG_INPUT or not PRODUCTION:
                 face_mask = self.GetContourIntersection(small_colour_frame, foreground_contours, faces_bboxes, (255, 255, 0))
                 person_mask = self.GetContourIntersection(small_colour_frame, foreground_contours, people_bboxes, (255, 0, 0))
                 tracker_mask = self.GetContourIntersection(small_colour_frame, foreground_contours, tracked_bboxes, (0, 255, 0))
@@ -858,7 +869,29 @@ max:'''+str(spots_max)+''',
                 
                 # Draw all debug onto the small_colour_frame
                 self.DrawBoxes(small_colour_frame, faces_bboxes, (255, 255, 0), 1)
-                self.DrawBoxes(small_colour_frame, people_bboxes, (255, 0, 0), 3)
+                #self.DrawBoxes(small_colour_frame, people_bboxes, (255, 0, 0), 3)
+                for i in range(0, len(people_bboxes)):
+                    person_bbox = people_bboxes[i]
+                    person_weight = float(people_weights[i])
+
+                    if person_weight < 0.13:
+                        text = 'None {:.1f}'.format(person_weight)
+                        width = 1
+                    elif person_weight < 0.3 and person_weight > 0.13:
+                        text = 'Low {:.1f}'.format(person_weight)
+                        width = 2
+                    elif person_weight < 0.7 and person_weight > 0.3:
+                        text = 'Med {:.1f}'.format(person_weight)
+                        width = 3
+                    elif person_weight > 0.7:
+                        text = 'High {:.1f}'.format(person_weight)
+                        width = 4
+
+                    colour_weight = width / 4.0
+                    colour = (int(255 * colour_weight), 0, 0)
+                    cv2.putText(small_colour_frame, text, (person_bbox[0], person_bbox[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 1)
+                    self.DrawBoxes(small_colour_frame, [person_bbox], colour, width)
+
                 self.DrawBoxes(small_colour_frame, tracked_bboxes, (0, 255, 0), 2)
                 self.DrawBoxes(small_colour_frame, foreground_bboxes, (0, 0, 255), 1)
 
@@ -942,6 +975,7 @@ max:'''+str(spots_max)+''',
             if PRODUCTION :
                 try: os.remove(input_file)
                 except: print("Error while deleting file : ", input_file)
+                pass
             print ('Finished processing file: ' + str(input_file) + ' and found ' + str(len(objects_tracked)) + ' unique objects in the video feed')
             self.monitor_completed_files.append(input_file)
 
